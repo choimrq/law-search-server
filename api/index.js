@@ -3,7 +3,7 @@
 
 const axios = require('axios');
 const convert = require('xml-js');
-const cheerio = require('cheerio'); // Import cheerio for HTML parsing
+const cheerio = require('cheerio'); // For HTML parsing (only used for 'prec' fullText)
 
 module.exports = async (req, res) => {
     // Set CORS headers to allow requests from any origin (for development)
@@ -17,7 +17,7 @@ module.exports = async (req, res) => {
     }
 
     try {
-        const { query } = req.query; // Get the search query from the request URL parameters
+        const { query, target } = req.query; // Get search query and target type ('prec' or 'law')
 
         // Validate if a query is provided
         if (!query) {
@@ -31,112 +31,141 @@ module.exports = async (req, res) => {
             return res.status(500).json({ error: '서버 설정 오류: API 키가 누락되었습니다.' });
         }
 
-        // --- 1단계: 판례 목록 검색 API 호출 (lawSearch.do) ---
-        const searchApiUrl = `https://www.law.go.kr/DRF/lawSearch.do?OC=${apiKey}&target=prec&type=XML&query=${encodeURIComponent(query)}&display=100`;
+        let formattedResults = [];
 
-        console.log(`[DEBUG] 1단계: 판례 목록 API 호출 시도: ${searchApiUrl}`);
+        if (target === 'prec') {
+            // --- 판례 검색 로직 (기존 로직 유지) ---
+            const searchApiUrl = `https://www.law.go.kr/DRF/lawSearch.do?OC=${apiKey}&target=prec&type=XML&query=${encodeURIComponent(query)}&display=100`;
 
-        const searchResponse = await axios.get(searchApiUrl);
-        const searchXmlData = searchResponse.data;
+            console.log(`[DEBUG] 판례 검색 (1단계): 판례 목록 API 호출 시도: ${searchApiUrl}`);
 
-        // Check if the response is an HTML page (indicating an error from the API itself)
-        if (typeof searchXmlData === 'string' && searchXmlData.trim().startsWith('<!DOCTYPE html')) {
-            console.error('[ERROR] 1단계: 국가법령정보 API가 HTML 오류 페이지를 반환했습니다. API 키 또는 요청을 확인하세요.');
-            return res.status(500).json({
-                error: '국가법령정보 API 오류: 예상치 못한 HTML 응답 (목록 검색)',
-                details: 'API 키가 유효하지 않거나, 요청이 잘못되었을 수 있습니다. 법제처에 문의하여 API 키를 확인해주세요.'
-            });
-        }
+            const searchResponse = await axios.get(searchApiUrl);
+            const searchXmlData = searchResponse.data;
 
-        const searchJsonData = convert.xml2json(searchXmlData, { compact: true, spaces: 4 });
-        const searchParsedData = JSON.parse(searchJsonData);
-
-        let precList = searchParsedData.PrecSearch?.prec || [];
-        if (precList && !Array.isArray(precList)) {
-            precList = [precList]; // Convert single object to an array for consistent processing
-        }
-
-        console.log(`[DEBUG] 1단계: 검색된 판례 수: ${precList.length}`);
-
-        // --- 2단계: 각 판례의 상세 링크(HTML)를 크롤링하여 전문(fullText) 가져오기 ---
-        const formattedCases = await Promise.all(precList.map(async (item) => {
-            const caseId = item.판례일련번호?._text || '';
-            const detailHtmlLink = item.판례상세링크?._text || ''; // Get the HTML detail link
-            let fullTextContent = '판결문 전문을 가져올 수 없습니다.'; // Default message if fetching/parsing fails
-
-            if (caseId && detailHtmlLink) {
-                console.log(`[DEBUG] 2단계: 판례 상세 HTML 링크 크롤링 시도 (ID: ${caseId}): ${detailHtmlLink}`);
-
-                try {
-                    const detailResponse = await axios.get(detailHtmlLink);
-                    const htmlData = detailResponse.data;
-
-                    // Check if the response is valid HTML (not an error page)
-                    if (typeof htmlData === 'string' && htmlData.trim().startsWith('<!DOCTYPE html')) {
-                        // Load HTML into cheerio for parsing
-                        const $ = cheerio.load(htmlData);
-
-                        // *** IMPORTANT: This selector needs to be accurate for the actual law.go.kr HTML structure ***
-                        // Based on typical law.go.kr judgment pages, the full text is often within a `div`
-                        // with a class like 'txt_view' or 'content_view'.
-                        // We will try 'div.txt_view' first, then 'div.content_view', then fallback to body text.
-                        let extractedText = '';
-                        let $contentDiv = $('div.txt_view'); 
-
-                        if ($contentDiv.length === 0) {
-                            $contentDiv = $('div.content_view');
-                        }
-                        if ($contentDiv.length === 0) {
-                            // Fallback: get all text from a likely content area within the body
-                            // This might need refinement based on actual HTML
-                            $contentDiv = $('body'); // Fallback to body if specific divs not found
-                        }
-
-                        if ($contentDiv.length > 0) {
-                            extractedText = $contentDiv.text().trim();
-                            // Basic cleanup: remove multiple newlines, leading/trailing whitespace
-                            extractedText = extractedText.replace(/\n\s*\n/g, '\n\n').trim();
-                        } else {
-                            extractedText = '판결문 전문을 추출할 수 없습니다. HTML 구조를 확인해주세요.';
-                        }
-                        
-                        if (extractedText === '') {
-                            fullTextContent = '판결문 전문 내용이 없습니다.';
-                        } else {
-                            fullTextContent = extractedText;
-                        }
-
-                        console.log(`[DEBUG] 2단계: 판결문 전문 추출 완료 (ID: ${caseId}), 길이: ${fullTextContent.length}`);
-
-                    } else {
-                        // If the response is not valid HTML, it's still an issue.
-                        console.warn(`[WARN] 2단계: 상세 판례 API (ID: ${caseId})가 예상치 못한 응답을 반환했습니다 (HTML 아님).`);
-                        fullTextContent = '판결문 전문을 가져오는 중 오류 발생 (예상치 못한 API 응답).';
-                    }
-                } catch (detailError) {
-                    console.error(`[ERROR] 2단계: 판례 상세 HTML 크롤링 중 에러 발생 (ID: ${caseId}):`, detailError.message);
-                    fullTextContent = `판결문 전문을 가져오는 데 실패했습니다: ${detailError.message}`;
-                }
+            if (typeof searchXmlData === 'string' && searchXmlData.trim().startsWith('<!DOCTYPE html')) {
+                console.error('[ERROR] 판례 검색 (1단계): 국가법령정보 API가 HTML 오류 페이지를 반환했습니다. API 키 또는 요청을 확인하세요.');
+                return res.status(500).json({
+                    error: '국가법령정보 API 오류: 예상치 못한 HTML 응답 (판례 목록 검색)',
+                    details: 'API 키가 유효하지 않거나, 요청이 잘못되었을 수 있습니다. 법제처에 문의하여 API 키를 확인해주세요.'
+                });
             }
 
-            return {
-                id: caseId,
-                caseNumber: item.사건번호?._text || '번호 없음',
-                title: item.사건명?._text || '제목 없음',
-                courtName: item.법원명?._text || '법원 없음',
-                caseType: item.사건종류명?._text || '종류 없음',
-                decisionDate: item.선고일자?._text || '날짜 없음',
-                summary: item.판시사항?._cdata || '요약 정보 없음', // 판시사항을 요약으로 사용
-                fullText: fullTextContent, // 크롤링하여 가져온 판결문 전문
-                link: detailHtmlLink // 원본 상세 HTML 링크
-            };
-        }));
+            const searchJsonData = convert.xml2json(searchXmlData, { compact: true, spaces: 4 });
+            const searchParsedData = JSON.parse(searchJsonData);
+
+            let precList = searchParsedData.PrecSearch?.prec || [];
+            if (precList && !Array.isArray(precList)) {
+                precList = [precList];
+            }
+
+            console.log(`[DEBUG] 판례 검색 (1단계): 검색된 판례 수: ${precList.length}`);
+
+            formattedResults = await Promise.all(precList.map(async (item) => {
+                const caseId = item.판례일련번호?._text || '';
+                const detailHtmlLink = item.판례상세링크?._text || '';
+                let fullTextContent = '판결문 전문을 가져올 수 없습니다.';
+
+                if (caseId && detailHtmlLink) {
+                    console.log(`[DEBUG] 판례 검색 (2단계): 판례 상세 HTML 링크 크롤링 시도 (ID: ${caseId}): ${detailHtmlLink}`);
+
+                    try {
+                        const detailResponse = await axios.get(detailHtmlLink);
+                        const htmlData = detailResponse.data;
+
+                        if (typeof htmlData === 'string' && htmlData.trim().startsWith('<!DOCTYPE html')) {
+                            const $ = cheerio.load(htmlData);
+                            let extractedText = '';
+                            let $contentDiv = $('div.txt_view'); // Common selector for judgment text
+
+                            if ($contentDiv.length === 0) {
+                                $contentDiv = $('div.content_view'); // Another common selector
+                            }
+                            if ($contentDiv.length === 0) {
+                                // Fallback: try to get text from a broader content area if specific divs not found
+                                $contentDiv = $('body'); // Or a more specific container if known
+                            }
+
+                            if ($contentDiv.length > 0) {
+                                extractedText = $contentDiv.text().trim();
+                                extractedText = extractedText.replace(/\n\s*\n/g, '\n\n').trim(); // Clean up multiple newlines
+                            } else {
+                                extractedText = '판결문 전문을 추출할 수 없습니다. HTML 구조를 확인해주세요.';
+                            }
+                            
+                            if (extractedText === '') {
+                                fullTextContent = '판결문 전문 내용이 없습니다.';
+                            } else {
+                                fullTextContent = extractedText;
+                            }
+                            console.log(`[DEBUG] 판례 검색 (2단계): 판결문 전문 추출 완료 (ID: ${caseId}), 길이: ${fullTextContent.length}`);
+
+                        } else {
+                            console.warn(`[WARN] 판례 검색 (2단계): 상세 판례 API (ID: ${caseId})가 예상치 못한 응답을 반환했습니다 (HTML 아님).`);
+                            fullTextContent = '판결문 전문을 가져오는 중 오류 발생 (예상치 못한 API 응답).';
+                        }
+                    } catch (detailError) {
+                        console.error(`[ERROR] 판례 검색 (2단계): 판례 상세 HTML 크롤링 중 에러 발생 (ID: ${caseId}):`, detailError.message);
+                        fullTextContent = `판결문 전문을 가져오는 데 실패했습니다: ${detailError.message}`;
+                    }
+                }
+
+                return {
+                    id: caseId,
+                    caseNumber: item.사건번호?._text || '번호 없음',
+                    title: item.사건명?._text || '제목 없음',
+                    courtName: item.법원명?._text || '법원 없음',
+                    caseType: item.사건종류명?._text || '종류 없음',
+                    decisionDate: item.선고일자?._text || '날짜 없음',
+                    summary: item.판시사항?._cdata || '요약 정보 없음',
+                    fullText: fullTextContent, // 크롤링하여 가져온 판결문 전문
+                    link: detailHtmlLink // 원본 상세 HTML 링크
+                };
+            }));
+        } else if (target === 'law') {
+            // --- 법령 검색 로직 ---
+            const lawSearchApiUrl = `https://www.law.go.kr/DRF/lawSearch.do?OC=${apiKey}&target=law&type=XML&query=${encodeURIComponent(query)}&display=100`;
+
+            console.log(`[DEBUG] 법령 검색: 법령 목록 API 호출 시도: ${lawSearchApiUrl}`);
+
+            const lawSearchResponse = await axios.get(lawSearchApiUrl);
+            const lawSearchXmlData = lawSearchResponse.data;
+
+            if (typeof lawSearchXmlData === 'string' && lawSearchXmlData.trim().startsWith('<!DOCTYPE html')) {
+                console.error('[ERROR] 법령 검색: 국가법령정보 API가 HTML 오류 페이지를 반환했습니다. API 키 또는 요청을 확인하세요.');
+                return res.status(500).json({
+                    error: '국가법령정보 API 오류: 예상치 못한 HTML 응답 (법령 목록 검색)',
+                    details: 'API 키가 유효하지 않거나, 요청이 잘못되었을 수 있습니다. 법제처에 문의하여 API 키를 확인해주세요.'
+                });
+            }
+
+            const lawSearchJsonData = convert.xml2json(lawSearchXmlData, { compact: true, spaces: 4 });
+            const lawSearchParsedData = JSON.parse(lawSearchJsonData);
+
+            let lawList = lawSearchParsedData.LawSearch?.law || [];
+            if (lawList && !Array.isArray(lawList)) {
+                lawList = [lawList];
+            }
+
+            console.log(`[DEBUG] 법령 검색: 검색된 법령 수: ${lawList.length}`);
+
+            formattedResults = lawList.map(item => ({
+                id: item.법령일련번호?._text || '', // 법령일련번호를 ID로 사용
+                title: item.법령명?._text || '제목 없음',
+                promulgationNumber: item.공포번호?._text || '번호 없음',
+                promulgationDate: item.공포일자?._text || '날짜 없음',
+                department: item.소관부처?._text || '소관부처 없음',
+                link: item.법령상세링크?._text || '' // 법령 상세 링크 제공
+                // 법령의 경우 fullText는 직접 크롤링하지 않음 (복잡성 및 정책 고려)
+            }));
+        } else {
+            return res.status(400).json({ error: '유효하지 않은 검색 대상입니다. (target 파라미터 오류)' });
+        }
 
         // Send the formatted results back to the frontend
-        res.status(200).json({ results: formattedCases }); // Wrap in 'results' object as expected by frontend
+        res.status(200).json({ results: formattedResults });
 
     } catch (error) {
         console.error('백엔드 서버 내부 오류 발생:', error.message);
-        res.status(500).json({ error: '판례 정보를 가져오는 데 실패했습니다.', details: error.message });
+        res.status(500).json({ error: '법률 정보를 가져오는 데 실패했습니다.', details: error.message });
     }
 };
