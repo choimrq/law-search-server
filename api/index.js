@@ -75,19 +75,18 @@ module.exports = async (req, res) => {
                         if (typeof htmlData === 'string' && htmlData.trim().startsWith('<!DOCTYPE html')) {
                             const $ = cheerio.load(htmlData);
                             let extractedText = '';
-                            let $contentDiv = $('div.txt_view'); // Common selector for judgment text
+                            let $contentDiv = $('div.txt_view'); 
 
                             if ($contentDiv.length === 0) {
-                                $contentDiv = $('div.content_view'); // Another common selector
+                                $contentDiv = $('div.content_view');
                             }
                             if ($contentDiv.length === 0) {
-                                // Fallback: try to get text from a broader content area if specific divs not found
-                                $contentDiv = $('body'); // Or a more specific container if known
+                                $contentDiv = $('body'); 
                             }
 
                             if ($contentDiv.length > 0) {
                                 extractedText = $contentDiv.text().trim();
-                                extractedText = extractedText.replace(/\n\s*\n/g, '\n\n').trim(); // Clean up multiple newlines
+                                extractedText = extractedText.replace(/\n\s*\n/g, '\n\n').trim(); 
                             } else {
                                 extractedText = '판결문 전문을 추출할 수 없습니다. HTML 구조를 확인해주세요.';
                             }
@@ -117,8 +116,8 @@ module.exports = async (req, res) => {
                     caseType: item.사건종류명?._text || '종류 없음',
                     decisionDate: item.선고일자?._text || '날짜 없음',
                     summary: item.판시사항?._cdata || '요약 정보 없음',
-                    fullText: fullTextContent, // 크롤링하여 가져온 판결문 전문
-                    link: detailHtmlLink // 원본 상세 HTML 링크
+                    fullText: fullTextContent,
+                    link: detailHtmlLink
                 };
             }));
         } else if (target === 'law') {
@@ -148,20 +147,23 @@ module.exports = async (req, res) => {
 
             console.log(`[DEBUG] 법령 검색: 검색된 법령 수: ${lawList.length}`);
 
-            formattedResults = lawList.map(item => ({
-                id: item.법령일련번호?._text || '', // 법령일련번호를 ID로 사용
-                title: item.법령명?._text || '제목 없음',
-                promulgationNumber: item.공포번호?._text || '번호 없음',
-                promulgationDate: item.공포일자?._text || '날짜 없음',
-                department: item.소관부처?._text || '소관부처 없음',
-                link: item.법령상세링크?._text || '' // 법령 상세 링크 제공
-                // 법령의 경우 fullText는 직접 크롤링하지 않음 (복잡성 및 정책 고려)
-            }));
+            formattedResults = lawList.map(item => {
+                const lawDetailLink = item.법령상세링크?._text || '';
+                console.log(`[DEBUG] 법령 검색: 법령 상세 링크: ${lawDetailLink}`); // 법령 상세 링크 로그 추가
+
+                return {
+                    id: item.법령일련번호?._text || '',
+                    title: item.법령명?._text || '제목 정보 없음', // '제목 없음' -> '제목 정보 없음'
+                    promulgationNumber: item.공포번호?._text || '번호 없음',
+                    promulgationDate: item.공포일자?._text || '날짜 없음',
+                    department: item.소관부처?._text || '소관부처 없음',
+                    link: lawDetailLink // 법령 상세 링크 제공
+                };
+            });
         } else {
             return res.status(400).json({ error: '유효하지 않은 검색 대상입니다. (target 파라미터 오류)' });
         }
 
-        // Send the formatted results back to the frontend
         res.status(200).json({ results: formattedResults });
 
     } catch (error) {
