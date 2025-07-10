@@ -30,59 +30,81 @@ module.exports = async (req, res) => {
             return res.status(500).json({ error: '서버 설정 오류: API 키가 누락되었습니다.' });
         }
 
-        // Construct the target URL for the National Law Information API
-        const targetUrl = `https://www.law.go.kr/DRF/lawSearch.do?OC=${apiKey}&target=prec&type=XML&query=${encodeURIComponent(query)}&display=100`;
+        // --- 1단계: 판례 목록 검색 API 호출 (lawSearch.do) ---
+        const searchApiUrl = `https://www.law.go.kr/DRF/lawSearch.do?OC=${apiKey}&target=prec&type=XML&query=${encodeURIComponent(query)}&display=100`;
 
-        console.log(`[DEBUG] 국가법령정보 API 호출 시도: ${targetUrl}`);
+        console.log(`[DEBUG] 1단계: 판례 목록 API 호출 시도: ${searchApiUrl}`);
 
-        const response = await axios.get(targetUrl);
-        const rawData = response.data; // Get raw data from the response
-
-        console.log(`[DEBUG] 국가법령정보 API로부터 받은 원본 데이터 (일부):`);
-        // 로그가 너무 길어지는 것을 방지하기 위해 처음 500자만 출력
-        console.log(rawData.substring(0, 500) + (rawData.length > 500 ? '...' : ''));
+        const searchResponse = await axios.get(searchApiUrl);
+        const searchXmlData = searchResponse.data;
 
         // Check if the response is an HTML page (indicating an error from the API itself)
-        if (typeof rawData === 'string' && rawData.trim().startsWith('<!DOCTYPE html')) {
-            console.error('[ERROR] 국가법령정보 API가 HTML 오류 페이지를 반환했습니다. API 키 또는 요청을 확인하세요.');
+        if (typeof searchXmlData === 'string' && searchXmlData.trim().startsWith('<!DOCTYPE html')) {
+            console.error('[ERROR] 1단계: 국가법령정보 API가 HTML 오류 페이지를 반환했습니다. API 키 또는 요청을 확인하세요.');
             return res.status(500).json({
-                error: '국가법령정보 API 오류: 예상치 못한 HTML 응답',
+                error: '국가법령정보 API 오류: 예상치 못한 HTML 응답 (목록 검색)',
                 details: 'API 키가 유효하지 않거나, 요청이 잘못되었을 수 있습니다. 법제처에 문의하여 API 키를 확인해주세요.'
             });
         }
 
-        // Proceed with XML to JSON conversion only if it's not an HTML page
-        const jsonData = convert.xml2json(rawData, { compact: true, spaces: 4 });
-        const parsedData = JSON.parse(jsonData);
+        const searchJsonData = convert.xml2json(searchXmlData, { compact: true, spaces: 4 });
+        const searchParsedData = JSON.parse(searchJsonData);
 
-        console.log(`[DEBUG] XML을 JSON으로 변환된 데이터:`);
-        console.log(parsedData);
-
-        // Extract and format the legal case list from the parsed data
-        let precList = parsedData.PrecSearch?.prec || [];
+        let precList = searchParsedData.PrecSearch?.prec || [];
         if (precList && !Array.isArray(precList)) {
             precList = [precList]; // Convert single object to an array for consistent processing
         }
 
-        // Map the raw API response items to a more user-friendly format
-        const formattedCases = precList.map(item => ({
-            id: item.판례일련번호?._text || '',
-            caseNumber: item.사건번호?._text || '번호 없음',
-            title: item.사건명?._text || '제목 없음',
-            courtName: item.법원명?._text || '법원 없음',
-            caseType: item.사건종류명?._text || '종류 없음',
-            decisionDate: item.선고일자?._text || '날짜 없음',
-            summary: item.판시사항?._cdata || '요약 정보 없음',
-            fullText: item.판결요지?._cdata || '상세 정보 없음',
-            link: `https://www.law.go.kr/DRF/lawService.do?OC=${apiKey}&target=prec&ID=${item.판례일련번호?._text || ''}&type=HTML` // Example link, adjust as per API
+        console.log(`[DEBUG] 1단계: 검색된 판례 수: ${precList.length}`);
+
+        // --- 2단계: 각 판례의 전문(fullText) 가져오기 (lawService.do) ---
+        const formattedCases = await Promise.all(precList.map(async (item) => {
+            const caseId = item.판례일련번호?._text || '';
+            let fullTextContent = '판결문 전문을 가져올 수 없습니다.'; // Default message if fetching fails
+
+            if (caseId) {
+                const fullTextApiUrl = `https://www.law.go.kr/DRF/lawService.do?OC=${apiKey}&target=prec&ID=${caseId}&type=TEXT`;
+                console.log(`[DEBUG] 2단계: 판례 전문 API 호출 시도 (ID: ${caseId}): ${fullTextApiUrl}`);
+
+                try {
+                    const fullTextResponse = await axios.get(fullTextApiUrl);
+                    const rawFullText = fullTextResponse.data;
+
+                    // Check if the full text response is also an HTML error page
+                    if (typeof rawFullText === 'string' && rawFullText.trim().startsWith('<!DOCTYPE html')) {
+                        console.warn(`[WARN] 2단계: 상세 판례 API (ID: ${caseId})가 HTML 오류 페이지를 반환했습니다. API 키 또는 요청을 확인하세요.`);
+                        fullTextContent = '판결문 전문을 가져오는 중 오류 발생 (API 응답 문제).';
+                    } else {
+                        // Assuming type=TEXT returns plain text
+                        fullTextContent = rawFullText.trim();
+                        if (fullTextContent === '') {
+                            fullTextContent = '판결문 전문 내용이 없습니다.';
+                        }
+                    }
+                } catch (fullTextError) {
+                    console.error(`[ERROR] 2단계: 판례 전문 API 호출 중 에러 발생 (ID: ${caseId}):`, fullTextError.message);
+                    fullTextContent = `판결문 전문을 가져오는 데 실패했습니다: ${fullTextError.message}`;
+                }
+            }
+
+            return {
+                id: caseId,
+                caseNumber: item.사건번호?._text || '번호 없음',
+                title: item.사건명?._text || '제목 없음',
+                courtName: item.법원명?._text || '법원 없음',
+                caseType: item.사건종류명?._text || '종류 없음',
+                decisionDate: item.선고일자?._text || '날짜 없음',
+                summary: item.판시사항?._cdata || '요약 정보 없음', // 판시사항을 요약으로 사용
+                fullText: fullTextContent, // 2단계에서 가져온 판결문 전문
+                link: `https://www.law.go.kr/DRF/lawService.do?OC=${apiKey}&target=prec&ID=${caseId}&type=HTML` // 상세 HTML 링크
+            };
         }));
 
         // Send the formatted results back to the frontend
         res.status(200).json({ results: formattedCases }); // Wrap in 'results' object as expected by frontend
 
     } catch (error) {
-        console.error('API 요청 중 에러 발생:', error.message);
-        // Provide a more informative error response
+        console.error('백엔드 서버 내부 오류 발생:', error.message);
         res.status(500).json({ error: '판례 정보를 가져오는 데 실패했습니다.', details: error.message });
     }
 };
