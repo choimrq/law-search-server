@@ -3,6 +3,7 @@
 
 const axios = require('axios');
 const convert = require('xml-js');
+const cheerio = require('cheerio'); // Import cheerio for HTML parsing
 
 module.exports = async (req, res) => {
     // Set CORS headers to allow requests from any origin (for development)
@@ -57,33 +58,64 @@ module.exports = async (req, res) => {
 
         console.log(`[DEBUG] 1단계: 검색된 판례 수: ${precList.length}`);
 
-        // --- 2단계: 각 판례의 전문(fullText) 가져오기 (lawService.do) ---
+        // --- 2단계: 각 판례의 상세 링크(HTML)를 크롤링하여 전문(fullText) 가져오기 ---
         const formattedCases = await Promise.all(precList.map(async (item) => {
             const caseId = item.판례일련번호?._text || '';
-            let fullTextContent = '판결문 전문을 가져올 수 없습니다.'; // Default message if fetching fails
+            const detailHtmlLink = item.판례상세링크?._text || ''; // Get the HTML detail link
+            let fullTextContent = '판결문 전문을 가져올 수 없습니다.'; // Default message if fetching/parsing fails
 
-            if (caseId) {
-                const fullTextApiUrl = `https://www.law.go.kr/DRF/lawService.do?OC=${apiKey}&target=prec&ID=${caseId}&type=TEXT`;
-                console.log(`[DEBUG] 2단계: 판례 전문 API 호출 시도 (ID: ${caseId}): ${fullTextApiUrl}`);
+            if (caseId && detailHtmlLink) {
+                console.log(`[DEBUG] 2단계: 판례 상세 HTML 링크 크롤링 시도 (ID: ${caseId}): ${detailHtmlLink}`);
 
                 try {
-                    const fullTextResponse = await axios.get(fullTextApiUrl);
-                    const rawFullText = fullTextResponse.data;
+                    const detailResponse = await axios.get(detailHtmlLink);
+                    const htmlData = detailResponse.data;
 
-                    // Check if the full text response is also an HTML error page
-                    if (typeof rawFullText === 'string' && rawFullText.trim().startsWith('<!DOCTYPE html')) {
-                        console.warn(`[WARN] 2단계: 상세 판례 API (ID: ${caseId})가 HTML 오류 페이지를 반환했습니다. API 키 또는 요청을 확인하세요.`);
-                        fullTextContent = '판결문 전문을 가져오는 중 오류 발생 (API 응답 문제).';
-                    } else {
-                        // Assuming type=TEXT returns plain text
-                        fullTextContent = rawFullText.trim();
-                        if (fullTextContent === '') {
-                            fullTextContent = '판결문 전문 내용이 없습니다.';
+                    // Check if the response is valid HTML (not an error page)
+                    if (typeof htmlData === 'string' && htmlData.trim().startsWith('<!DOCTYPE html')) {
+                        // Load HTML into cheerio for parsing
+                        const $ = cheerio.load(htmlData);
+
+                        // *** IMPORTANT: This selector needs to be accurate for the actual law.go.kr HTML structure ***
+                        // Based on typical law.go.kr judgment pages, the full text is often within a `div`
+                        // with a class like 'txt_view' or 'content_view'.
+                        // We will try 'div.txt_view' first, then 'div.content_view', then fallback to body text.
+                        let extractedText = '';
+                        let $contentDiv = $('div.txt_view'); 
+
+                        if ($contentDiv.length === 0) {
+                            $contentDiv = $('div.content_view');
                         }
+                        if ($contentDiv.length === 0) {
+                            // Fallback: get all text from a likely content area within the body
+                            // This might need refinement based on actual HTML
+                            $contentDiv = $('body'); // Fallback to body if specific divs not found
+                        }
+
+                        if ($contentDiv.length > 0) {
+                            extractedText = $contentDiv.text().trim();
+                            // Basic cleanup: remove multiple newlines, leading/trailing whitespace
+                            extractedText = extractedText.replace(/\n\s*\n/g, '\n\n').trim();
+                        } else {
+                            extractedText = '판결문 전문을 추출할 수 없습니다. HTML 구조를 확인해주세요.';
+                        }
+                        
+                        if (extractedText === '') {
+                            fullTextContent = '판결문 전문 내용이 없습니다.';
+                        } else {
+                            fullTextContent = extractedText;
+                        }
+
+                        console.log(`[DEBUG] 2단계: 판결문 전문 추출 완료 (ID: ${caseId}), 길이: ${fullTextContent.length}`);
+
+                    } else {
+                        // If the response is not valid HTML, it's still an issue.
+                        console.warn(`[WARN] 2단계: 상세 판례 API (ID: ${caseId})가 예상치 못한 응답을 반환했습니다 (HTML 아님).`);
+                        fullTextContent = '판결문 전문을 가져오는 중 오류 발생 (예상치 못한 API 응답).';
                     }
-                } catch (fullTextError) {
-                    console.error(`[ERROR] 2단계: 판례 전문 API 호출 중 에러 발생 (ID: ${caseId}):`, fullTextError.message);
-                    fullTextContent = `판결문 전문을 가져오는 데 실패했습니다: ${fullTextError.message}`;
+                } catch (detailError) {
+                    console.error(`[ERROR] 2단계: 판례 상세 HTML 크롤링 중 에러 발생 (ID: ${caseId}):`, detailError.message);
+                    fullTextContent = `판결문 전문을 가져오는 데 실패했습니다: ${detailError.message}`;
                 }
             }
 
@@ -95,8 +127,8 @@ module.exports = async (req, res) => {
                 caseType: item.사건종류명?._text || '종류 없음',
                 decisionDate: item.선고일자?._text || '날짜 없음',
                 summary: item.판시사항?._cdata || '요약 정보 없음', // 판시사항을 요약으로 사용
-                fullText: fullTextContent, // 2단계에서 가져온 판결문 전문
-                link: `https://www.law.go.kr/DRF/lawService.do?OC=${apiKey}&target=prec&ID=${caseId}&type=HTML` // 상세 HTML 링크
+                fullText: fullTextContent, // 크롤링하여 가져온 판결문 전문
+                link: detailHtmlLink // 원본 상세 HTML 링크
             };
         }));
 
