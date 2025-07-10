@@ -33,21 +33,30 @@ module.exports = async (req, res) => {
         // Construct the target URL for the National Law Information API
         const targetUrl = `https://www.law.go.kr/DRF/lawSearch.do?OC=${apiKey}&target=prec&type=XML&query=${encodeURIComponent(query)}&display=100`;
 
-        console.log(`[DEBUG] 국가법령정보 API 호출 시도: ${targetUrl}`); // 디버깅 로그
+        console.log(`[DEBUG] 국가법령정보 API 호출 시도: ${targetUrl}`);
 
-        // Make the HTTP request to the National Law Information API
         const response = await axios.get(targetUrl);
-        const xmlData = response.data; // Get XML data from the response
+        const rawData = response.data; // Get raw data from the response
 
-        console.log(`[DEBUG] 국가법령정보 API로부터 받은 원본 XML 데이터:`); // 디버깅 로그
-        console.log(xmlData); // 원본 XML 데이터를 로그로 출력
+        console.log(`[DEBUG] 국가법령정보 API로부터 받은 원본 데이터 (일부):`);
+        // 로그가 너무 길어지는 것을 방지하기 위해 처음 500자만 출력
+        console.log(rawData.substring(0, 500) + (rawData.length > 500 ? '...' : ''));
 
-        // Convert XML data to JSON
-        const jsonData = convert.xml2json(xmlData, { compact: true, spaces: 4 });
+        // Check if the response is an HTML page (indicating an error from the API itself)
+        if (typeof rawData === 'string' && rawData.trim().startsWith('<!DOCTYPE html')) {
+            console.error('[ERROR] 국가법령정보 API가 HTML 오류 페이지를 반환했습니다. API 키 또는 요청을 확인하세요.');
+            return res.status(500).json({
+                error: '국가법령정보 API 오류: 예상치 못한 HTML 응답',
+                details: 'API 키가 유효하지 않거나, 요청이 잘못되었을 수 있습니다. 법제처에 문의하여 API 키를 확인해주세요.'
+            });
+        }
+
+        // Proceed with XML to JSON conversion only if it's not an HTML page
+        const jsonData = convert.xml2json(rawData, { compact: true, spaces: 4 });
         const parsedData = JSON.parse(jsonData);
 
-        console.log(`[DEBUG] XML을 JSON으로 변환된 데이터:`); // 디버깅 로그
-        console.log(parsedData); // 변환된 JSON 데이터를 로그로 출력
+        console.log(`[DEBUG] XML을 JSON으로 변환된 데이터:`);
+        console.log(parsedData);
 
         // Extract and format the legal case list from the parsed data
         let precList = parsedData.PrecSearch?.prec || [];
