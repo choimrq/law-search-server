@@ -1,4 +1,4 @@
-// File: /api/search.js
+// File: /api/index.js
 const axios = require('axios');
 const convert = require('xml-js');
 
